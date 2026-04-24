@@ -121,6 +121,7 @@ const fromDoc = (d, id) => ({
   repeat: d.rec || 'none',
   done: !!d.done,
   order: d.order || 0,
+  canvasUid: d.canvasUid || null,
 });
 
 const toDoc = t => ({
@@ -132,6 +133,7 @@ const toDoc = t => ({
   note: t.note || '',
   rec: t.repeat || 'none',
   done: !!t.done,
+  ...(t.canvasUid ? { canvasUid: t.canvasUid } : {}),
 });
 
 // ─── Media query hook for responsive layout ────────────────────────────────
@@ -997,30 +999,212 @@ function DayModal({ dateKey, tasks, onToggle, onEdit, onDelete, onClose, onAdd }
   );
 }
 
+// ─── Canvas .ics parser ────────────────────────────────────────────────────
+// Fetches a Canvas calendar feed URL via a CORS proxy, parses the iCalendar
+// text, and returns an array of task-shaped objects ready to write to Firestore.
+// Swap CORS_PROXY for your own Firebase Cloud Function URL if preferred.
+const CORS_PROXY = 'https://api.allorigins.win/raw?url=';
+
+async function fetchCanvasTasks(feedUrl) {
+  const res = await fetch(CORS_PROXY + encodeURIComponent(feedUrl));
+  if (!res.ok) throw new Error(`Failed to fetch feed (HTTP ${res.status})`);
+  const text = await res.text();
+  return parseICS(text);
+}
+
+function parseICS(text) {
+  // Unfold continued lines (lines starting with space/tab are continuations).
+  const unfolded = text.replace(/\r\n[ \t]/g, '').replace(/\n[ \t]/g, '');
+  const lines = unfolded.split(/\r\n|\n|\r/);
+
+  const events = [];
+  let current = null;
+
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (line === 'BEGIN:VEVENT') { current = {}; continue; }
+    if (line === 'END:VEVENT')   { if (current) events.push(current); current = null; continue; }
+    if (!current) continue;
+
+    // Split on first colon, handling property parameters (e.g. DTSTART;TZID=…:value).
+    const colon = line.indexOf(':');
+    if (colon === -1) continue;
+    const key   = line.slice(0, colon).split(';')[0].toUpperCase();
+    const value = line.slice(colon + 1).trim();
+
+    if (key === 'SUMMARY')     current.title    = decodeICSText(value);
+    if (key === 'DESCRIPTION') current.note     = decodeICSText(value).slice(0, 200);
+    if (key === 'UID')         current.uid      = value;
+    if (key === 'DTDUE' || key === 'DUE' || key === 'DTSTART') {
+      // Only set date if not already set by a DUE/DTDUE field.
+      if (!current.date || key !== 'DTSTART') {
+        const parsed = parseICSDate(value);
+        if (parsed) { current.date = parsed.date; current.time = parsed.time; }
+      }
+    }
+  }
+
+  // Convert to task shape: category School, priority medium, repeat none.
+  return events
+    .filter(e => e.title && e.uid)
+    .map(e => ({
+      title:    e.title,
+      category: 'School',
+      priority: 'medium',
+      date:     e.date  || '',
+      time:     e.time  || '',
+      note:     e.note  || '',
+      repeat:   'none',
+      done:     false,
+      canvasUid: e.uid,   // stored in Firestore for dedup
+    }));
+}
+
+function parseICSDate(value) {
+  // DATE-only: 20250415
+  const dateOnly = value.match(/^(\d{4})(\d{2})(\d{2})$/);
+  if (dateOnly) {
+    return { date: `${dateOnly[1]}-${dateOnly[2]}-${dateOnly[3]}`, time: '' };
+  }
+  // DATE-TIME (local or UTC): 20250415T230000[Z]
+  const dt = value.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z?)$/);
+  if (dt) {
+    let date = `${dt[1]}-${dt[2]}-${dt[3]}`;
+    let time = `${dt[4]}:${dt[5]}`;
+    // If UTC, convert to local time.
+    if (dt[7] === 'Z') {
+      const local = new Date(`${date}T${time}:00Z`);
+      date = dayKey(local);
+      time = `${String(local.getHours()).padStart(2,'0')}:${String(local.getMinutes()).padStart(2,'0')}`;
+    }
+    return { date, time };
+  }
+  return null;
+}
+
+function decodeICSText(s) {
+  return s
+    .replace(/\\n/g, ' ')
+    .replace(/\\,/g, ',')
+    .replace(/\\;/g, ';')
+    .replace(/\\\\/g, '\\')
+    .replace(/<[^>]+>/g, '')   // strip any HTML tags Canvas sometimes includes
+    .trim();
+}
+
+// ─── Canvas Import Panel (rendered inside SettingsModal) ──────────────────
+function CanvasImportPanel({ existingTasks, onImport }) {
+  const T = useTheme();
+  const [url,     setUrl]     = useState('');
+  const [status,  setStatus]  = useState('idle'); // idle | loading | done | error
+  const [result,  setResult]  = useState(null);   // { added, skipped }
+  const [errMsg,  setErrMsg]  = useState('');
+
+  const existingUids = useMemo(
+    () => new Set(existingTasks.map(t => t.canvasUid).filter(Boolean)),
+    [existingTasks]
+  );
+
+  const run = async () => {
+    const trimmed = url.trim();
+    if (!trimmed) return;
+    setStatus('loading'); setResult(null); setErrMsg('');
+    try {
+      const parsed = await fetchCanvasTasks(trimmed);
+      const fresh  = parsed.filter(t => !existingUids.has(t.canvasUid));
+      await onImport(fresh);
+      setResult({ added: fresh.length, skipped: parsed.length - fresh.length });
+      setStatus('done');
+    } catch (e) {
+      setErrMsg(e.message || 'Something went wrong.');
+      setStatus('error');
+    }
+  };
+
+  const inputStyle = {
+    width: '100%', padding: '9px 12px', borderRadius: 8,
+    border: `1px solid ${status === 'error' ? '#ef4444' : T.border2}`,
+    background: T.surface2, color: T.text, fontSize: 13,
+    fontFamily: 'Inter, sans-serif', outline: 'none',
+  };
+
+  return (
+    <div style={{ marginTop: 4 }}>
+      {/* How to find your URL */}
+      <div style={{ fontSize: 12, color: T.textSub, lineHeight: 1.6, marginBottom: 10, padding: '10px 12px', background: T.surface2, borderRadius: 8, border: `1px solid ${T.border}` }}>
+        <strong style={{ color: T.text, fontWeight: 600 }}>How to get your Canvas feed URL:</strong><br/>
+        In Canvas → <em>Calendar</em> → scroll to the bottom of the left sidebar → click <em>Calendar Feed</em> → copy the link.
+      </div>
+
+      <input
+        type="url"
+        value={url}
+        onChange={e => { setUrl(e.target.value); setStatus('idle'); setResult(null); }}
+        placeholder="https://canvas.instructure.com/feeds/calendars/user_…"
+        style={inputStyle}
+      />
+
+      {errMsg && (
+        <div style={{ fontSize: 12, color: '#ef4444', marginTop: 6 }}>{errMsg}</div>
+      )}
+
+      {status === 'done' && result && (
+        <div style={{ fontSize: 12, color: '#1D9E75', marginTop: 6, fontWeight: 500 }}>
+          ✓ {result.added} assignment{result.added !== 1 ? 's' : ''} imported
+          {result.skipped > 0 ? `, ${result.skipped} already existed` : ''}.
+        </div>
+      )}
+
+      <button
+        onClick={run}
+        disabled={!url.trim() || status === 'loading'}
+        style={{
+          marginTop: 10, width: '100%', padding: '9px 0', borderRadius: 8, border: 'none',
+          background: (!url.trim() || status === 'loading') ? T.surface3 : T.accent,
+          color: (!url.trim() || status === 'loading') ? T.textSub : '#fff',
+          fontSize: 13, fontWeight: 600, cursor: (!url.trim() || status === 'loading') ? 'default' : 'pointer',
+          fontFamily: 'Inter, sans-serif', transition: 'background .15s',
+        }}>
+        {status === 'loading' ? 'Importing…' : 'Import assignments'}
+      </button>
+    </div>
+  );
+}
+
 // ─── Settings Modal ────────────────────────────────────────────────────────
-function SettingsModal({ prefs, setPref, onClose }) {
+function SettingsModal({ prefs, setPref, existingTasks, onCanvasImport, onClose }) {
   const T = useTheme();
   const isMobile = useMedia('(max-width: 640px)');
+  const [canvasOpen, setCanvasOpen] = useState(false);
+
   const row = { display:'flex', alignItems:'center', justifyContent:'space-between', padding:'14px 0', borderBottom:`1px solid ${T.border}` };
+  const Toggle = ({ checked, onChange }) => (
+    <label style={{ position:'relative', width:42, height:24, cursor:'pointer', flexShrink:0 }}>
+      <input type="checkbox" checked={checked} onChange={onChange} style={{ opacity:0, width:0, height:0 }}/>
+      <span style={{ position:'absolute', inset:0, background: checked ? T.accent : T.border2, borderRadius:999, transition:'background .15s' }}/>
+      <span style={{ position:'absolute', top:2, left: checked ? 20 : 2, width:20, height:20, background:'#fff', borderRadius:'50%', transition:'left .15s', boxShadow:'0 1px 3px rgba(0,0,0,0.2)' }}/>
+    </label>
+  );
+
   return (
     <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.45)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:200, backdropFilter:'blur(5px)', padding: isMobile ? 8 : 16 }}
       onClick={e => e.target===e.currentTarget && onClose()}>
-      <div style={{ background:T.surface, border:`1px solid ${T.border2}`, borderRadius:18, padding: isMobile ? 20 : 28, width:440, maxWidth:'96vw', maxHeight:'90vh', overflowY:'auto', boxShadow:`0 24px 60px ${T.shadow}` }}>
+      <div style={{ background:T.surface, border:`1px solid ${T.border2}`, borderRadius:18, padding: isMobile ? 20 : 28, width:460, maxWidth:'96vw', maxHeight:'92vh', overflowY:'auto', boxShadow:`0 24px 60px ${T.shadow}` }}>
+
         <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:18 }}>
           <span style={{ fontWeight:700, fontSize:16, color:T.text }}>Settings</span>
           <button onClick={onClose} style={{ background:'none', border:'none', cursor:'pointer', padding:4, borderRadius:6 }}><Icon name="x" size={16} color={T.textSub}/></button>
         </div>
+
+        {/* ── Appearance ── */}
+        <div style={{ fontSize:11, fontWeight:700, color:T.textDim, letterSpacing:'0.08em', textTransform:'uppercase', marginBottom:4 }}>Appearance</div>
 
         <div style={row}>
           <div>
             <div style={{ fontSize:14, color:T.text, fontWeight:500 }}>Dark mode</div>
             <div style={{ fontSize:12, color:T.textSub, marginTop:2 }}>Use a darker color scheme</div>
           </div>
-          <label style={{ position:'relative', width:42, height:24, cursor:'pointer' }}>
-            <input type="checkbox" checked={prefs.darkMode} onChange={e=>setPref('darkMode', e.target.checked)} style={{ opacity:0, width:0, height:0 }}/>
-            <span style={{ position:'absolute', inset:0, background: prefs.darkMode ? T.accent : T.border2, borderRadius:999, transition:'background .15s' }}/>
-            <span style={{ position:'absolute', top:2, left: prefs.darkMode ? 20 : 2, width:20, height:20, background:'#fff', borderRadius:'50%', transition:'left .15s', boxShadow:'0 1px 3px rgba(0,0,0,0.2)' }}/>
-          </label>
+          <Toggle checked={prefs.darkMode} onChange={e=>setPref('darkMode', e.target.checked)}/>
         </div>
 
         <div style={row}>
@@ -1037,24 +1221,48 @@ function SettingsModal({ prefs, setPref, onClose }) {
             <div style={{ fontSize:14, color:T.text, fontWeight:500 }}>Compact task rows</div>
             <div style={{ fontSize:12, color:T.textSub, marginTop:2 }}>Tighter spacing in the task list</div>
           </div>
-          <label style={{ position:'relative', width:42, height:24, cursor:'pointer' }}>
-            <input type="checkbox" checked={prefs.compact} onChange={e=>setPref('compact', e.target.checked)} style={{ opacity:0, width:0, height:0 }}/>
-            <span style={{ position:'absolute', inset:0, background: prefs.compact ? T.accent : T.border2, borderRadius:999, transition:'background .15s' }}/>
-            <span style={{ position:'absolute', top:2, left: prefs.compact ? 20 : 2, width:20, height:20, background:'#fff', borderRadius:'50%', transition:'left .15s', boxShadow:'0 1px 3px rgba(0,0,0,0.2)' }}/>
-          </label>
+          <Toggle checked={prefs.compact} onChange={e=>setPref('compact', e.target.checked)}/>
         </div>
 
-        <div style={{ ...row, borderBottom:'none' }}>
+        <div style={{ ...row, marginBottom: 20 }}>
           <div>
             <div style={{ fontSize:14, color:T.text, fontWeight:500 }}>Show task notes</div>
             <div style={{ fontSize:12, color:T.textSub, marginTop:2 }}>Display the note field inline</div>
           </div>
-          <label style={{ position:'relative', width:42, height:24, cursor:'pointer' }}>
-            <input type="checkbox" checked={prefs.showNotes} onChange={e=>setPref('showNotes', e.target.checked)} style={{ opacity:0, width:0, height:0 }}/>
-            <span style={{ position:'absolute', inset:0, background: prefs.showNotes ? T.accent : T.border2, borderRadius:999, transition:'background .15s' }}/>
-            <span style={{ position:'absolute', top:2, left: prefs.showNotes ? 20 : 2, width:20, height:20, background:'#fff', borderRadius:'50%', transition:'left .15s', boxShadow:'0 1px 3px rgba(0,0,0,0.2)' }}/>
-          </label>
+          <Toggle checked={prefs.showNotes} onChange={e=>setPref('showNotes', e.target.checked)}/>
         </div>
+
+        {/* ── Integrations ── */}
+        <div style={{ fontSize:11, fontWeight:700, color:T.textDim, letterSpacing:'0.08em', textTransform:'uppercase', marginBottom:12 }}>Integrations</div>
+
+        <div style={{ border:`1px solid ${T.border}`, borderRadius:12, overflow:'hidden' }}>
+          {/* Canvas header row — tap to expand */}
+          <button onClick={()=>setCanvasOpen(o=>!o)}
+            style={{ width:'100%', display:'flex', alignItems:'center', justifyContent:'space-between', padding:'14px 16px', background:'transparent', border:'none', cursor:'pointer', fontFamily:'Inter,sans-serif' }}>
+            <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+              {/* Canvas logo mark */}
+              <svg width="28" height="28" viewBox="0 0 100 100" style={{ flexShrink:0 }}>
+                <rect width="100" height="100" rx="18" fill="#E66000"/>
+                <text x="50" y="72" textAnchor="middle" fontSize="58" fontWeight="700" fill="#fff" fontFamily="Arial,sans-serif">C</text>
+              </svg>
+              <div style={{ textAlign:'left' }}>
+                <div style={{ fontSize:14, fontWeight:600, color:T.text }}>Canvas LMS</div>
+                <div style={{ fontSize:12, color:T.textSub }}>Import assignments as tasks</div>
+              </div>
+            </div>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={T.textSub} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
+              style={{ transform: canvasOpen ? 'rotate(180deg)' : 'none', transition:'transform .2s', flexShrink:0 }}>
+              <polyline points="6 9 12 15 18 9"/>
+            </svg>
+          </button>
+
+          {canvasOpen && (
+            <div style={{ padding:'0 16px 16px', borderTop:`1px solid ${T.border}` }}>
+              <CanvasImportPanel existingTasks={existingTasks} onImport={onCanvasImport}/>
+            </div>
+          )}
+        </div>
+
       </div>
     </div>
   );
@@ -1280,7 +1488,15 @@ function App() {
           onAdd={()=>{ setDayModal(null); setModal({_preDate: dayModal.key}); }}/>
       )}
       {settingsOpen && (
-        <SettingsModal prefs={prefs} setPref={setPref} onClose={()=>setSettingsOpen(false)}/>
+        <SettingsModal prefs={prefs} setPref={setPref}
+          existingTasks={tasks}
+          onCanvasImport={async (newTasks) => {
+            // Write each imported task to Firestore, including canvasUid for future dedup.
+            for (const t of newTasks) {
+              await addTask(t);
+            }
+          }}
+          onClose={()=>setSettingsOpen(false)}/>
       )}
     </ThemeCtx.Provider>
   );
