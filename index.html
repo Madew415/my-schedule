@@ -392,18 +392,44 @@ function DatePicker({ value, onChange }) {
   );
 }
 
-// ─── Custom TimePicker ────────────────────────────────────────────────────
+// ─── Custom TimePicker (12h AM/PM) ────────────────────────────────────────
+// Internally stores and emits 24h "HH:MM" strings (matching Firestore), but
+// shows 1–12 hours + AM/PM columns to the user.
 function TimePicker({ value, onChange }) {
   const T = useTheme();
   const [open, setOpen] = useState(false);
-  const ref = useRef(null);
-  const hrRef = useRef(null);
-  const mnRef = useRef(null);
+  const ref    = useRef(null);
+  const hrRef  = useRef(null);
+  const mnRef  = useRef(null);
+  const amRef  = useRef(null);
 
-  const hours   = Array.from({ length: 24 }, (_, i) => String(i).padStart(2, '0'));
-  const minutes = Array.from({ length: 12 }, (_, i) => String(i * 5).padStart(2, '0'));
+  // Parse the stored 24h value into 12h display parts.
+  const parse12 = (v) => {
+    if (!v) return { h12: '9', min: '00', ampm: 'AM' };
+    const [hStr, mStr] = v.split(':');
+    const h24 = parseInt(hStr, 10);
+    const ampm = h24 < 12 ? 'AM' : 'PM';
+    const h12  = h24 === 0 ? 12 : h24 > 12 ? h24 - 12 : h24;
+    return { h12: String(h12), min: mStr || '00', ampm };
+  };
 
-  const [selH, selM] = value ? value.split(':') : ['09', '00'];
+  // Convert 12h parts back to a 24h "HH:MM" string.
+  const to24 = (h12, min, ampm) => {
+    let h = parseInt(h12, 10);
+    if (ampm === 'AM' && h === 12) h = 0;
+    else if (ampm === 'PM' && h !== 12) h += 12;
+    return `${String(h).padStart(2, '0')}:${min}`;
+  };
+
+  const { h12: selH, min: selM, ampm: selAP } = parse12(value);
+
+  const hours12  = ['12','1','2','3','4','5','6','7','8','9','10','11'];
+  const minutes  = Array.from({ length: 12 }, (_, i) => String(i * 5).padStart(2, '0'));
+
+  // Display label shown on the closed picker field.
+  const displayTime = value
+    ? (() => { const {h12,min,ampm} = parse12(value); return `${h12}:${min} ${ampm}`; })()
+    : 'Pick a time';
 
   useEffect(() => {
     if (!open) return;
@@ -415,19 +441,21 @@ function TimePicker({ value, onChange }) {
   useEffect(() => {
     if (!open) return;
     setTimeout(() => {
-      if (hrRef.current) { const el = hrRef.current.querySelector('[data-sel="1"]'); if (el) el.scrollIntoView({ block: 'center' }); }
-      if (mnRef.current) { const el = mnRef.current.querySelector('[data-sel="1"]'); if (el) el.scrollIntoView({ block: 'center' }); }
+      [hrRef, mnRef, amRef].forEach(r => {
+        if (r.current) {
+          const el = r.current.querySelector('[data-sel="1"]');
+          if (el) el.scrollIntoView({ block: 'center' });
+        }
+      });
     }, 50);
   }, [open]);
 
-  const displayTime = value || 'Pick a time';
   const fieldStyle = {
     background: T.surface2, border: `1px solid ${T.border2}`, borderRadius: 8,
     color: value ? T.text : T.textSub, padding: '9px 12px', fontSize: 14, width: '100%',
     cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between', userSelect: 'none',
   };
-
-  const colStyle = { width: 52, maxHeight: 200, overflowY: 'auto', scrollbarWidth: 'none' };
+  const colStyle = { width: 44, maxHeight: 200, overflowY: 'auto', scrollbarWidth: 'none' };
   const itemStyle = (active) => ({
     padding: '7px 0', textAlign: 'center', fontSize: 13, fontWeight: active ? 700 : 400,
     color: active ? T.accent : T.text, background: active ? T.accentSoft : 'transparent',
@@ -443,26 +471,40 @@ function TimePicker({ value, onChange }) {
         </svg>
       </div>
       {open && (
-        <div style={{ position: 'absolute', top: 'calc(100% + 6px)', left: 0, zIndex: 300, background: T.surface, border: `1px solid ${T.border2}`, borderRadius: 14, padding: '10px 6px', boxShadow: `0 16px 48px ${T.shadow}`, display: 'flex', flexDirection: 'column', alignItems: 'center', width: 130 }}>
-          <div style={{ fontSize: 10, color: T.textSub, fontWeight: 600, letterSpacing: '0.06em', marginBottom: 8, display: 'flex', gap: 28 }}>
-            <span>HR</span><span>MIN</span>
+        <div style={{ position: 'absolute', top: 'calc(100% + 6px)', left: 0, zIndex: 300, background: T.surface, border: `1px solid ${T.border2}`, borderRadius: 14, padding: '10px 8px 10px 6px', boxShadow: `0 16px 48px ${T.shadow}`, display: 'flex', flexDirection: 'column', alignItems: 'center', width: 162 }}>
+          <div style={{ fontSize: 10, color: T.textSub, fontWeight: 600, letterSpacing: '0.06em', marginBottom: 8, display: 'flex', gap: 0, width: '100%', justifyContent: 'space-around' }}>
+            <span style={{ width: 44, textAlign: 'center' }}>HR</span>
+            <span style={{ width: 44, textAlign: 'center' }}>MIN</span>
+            <span style={{ width: 44, textAlign: 'center' }}>AM/PM</span>
           </div>
           <div style={{ display: 'flex', gap: 4 }}>
+            {/* Hours 1–12 */}
             <div ref={hrRef} style={colStyle}>
-              {hours.map(h => (
+              {hours12.map(h => (
                 <div key={h} data-sel={h===selH?'1':undefined}
                   style={itemStyle(h===selH)}
-                  onClick={() => { onChange(`${h}:${selM}`); }}>
+                  onClick={() => onChange(to24(h, selM, selAP))}>
                   {h}
                 </div>
               ))}
             </div>
+            {/* Minutes */}
             <div ref={mnRef} style={colStyle}>
               {minutes.map(m => (
                 <div key={m} data-sel={m===selM?'1':undefined}
                   style={itemStyle(m===selM)}
-                  onClick={() => { onChange(`${selH}:${m}`); }}>
+                  onClick={() => onChange(to24(selH, m, selAP))}>
                   {m}
+                </div>
+              ))}
+            </div>
+            {/* AM / PM */}
+            <div ref={amRef} style={{ ...colStyle, maxHeight: 'none' }}>
+              {['AM','PM'].map(ap => (
+                <div key={ap} data-sel={ap===selAP?'1':undefined}
+                  style={itemStyle(ap===selAP)}
+                  onClick={() => onChange(to24(selH, selM, ap))}>
+                  {ap}
                 </div>
               ))}
             </div>
@@ -602,7 +644,7 @@ function TaskRow({ task, onToggle, onEdit, onDelete, dragHandlers, compact, show
           {task.repeat && task.repeat !== 'none' && <Icon name="repeat" size={10} color={T.textSub}/>}
         </div>
         <div style={{ display:'flex', alignItems:'center', gap:6, flexWrap:'wrap' }}>
-          <span style={{ fontSize:12, color:T.textSub }}>{dateLabel}{task.time?` · ${task.time}`:''}</span>
+          <span style={{ fontSize:12, color:T.textSub }}>{dateLabel}{task.time?` · ${(()=>{const[hS,mS]=task.time.split(':');const h=parseInt(hS,10);const ap=h<12?'AM':'PM';const h12=h===0?12:h>12?h-12:h;return`${h12}:${mS} ${ap}`;})()}`:''}</span>
           <Badge label={task.priority} bg={pri.bg} color={pri.text}/>
           {task.repeat && task.repeat !== 'none' && <Badge label={REPEAT_LBL[task.repeat]} bg={T.accentSoft} color={T.accent}/>}
           {isSoon && !isToday && <Badge label="Due soon" bg="rgba(245,158,11,0.14)" color="#f59e0b"/>}
